@@ -6,7 +6,9 @@ import { supabase } from '../lib/supabaseClient';
 export default function Home() {
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [message, setMessage] = useState('');
+  const [result, setResult] = useState(null);
 
   async function handleUpload() {
     if (!file) {
@@ -15,9 +17,9 @@ export default function Home() {
     }
 
     setUploading(true);
+    setResult(null);
     setMessage('업로드 중...');
 
-    // 원본 파일명이 한글이나 공백을 포함해도 문제없도록, 확장자만 남기고 새 이름을 만들어요
     const fileExt = file.name.split('.').pop();
     const fileName = `${Date.now()}.${fileExt}`;
 
@@ -35,34 +37,63 @@ export default function Home() {
       .from('note-images')
       .getPublicUrl(fileName);
 
-    const { error: insertError } = await supabase
+    const { data: noteData, error: insertError } = await supabase
       .from('notes')
-      .insert({ image_url: urlData.publicUrl, status: 'pending' });
+      .insert({ image_url: urlData.publicUrl, status: 'pending' })
+      .select()
+      .single();
 
     if (insertError) {
       setMessage('기록 저장 실패: ' + insertError.message);
-    } else {
-      setMessage('업로드 성공! 접수 대장에 기록됐어요 ✅');
+      setUploading(false);
+      return;
     }
 
+    setMessage('업로드 성공! 이제 AI가 분석하도록 요청할게요...');
     setUploading(false);
+
+    setAnalyzing(true);
+    const analyzeResponse = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ noteId: noteData.id, imageUrl: urlData.publicUrl }),
+    });
+
+    const analyzeData = await analyzeResponse.json();
+    setAnalyzing(false);
+
+    if (analyzeData.success) {
+      setMessage('분석 완료! ✅');
+      setResult(analyzeData);
+    } else {
+      setMessage('분석 실패: ' + analyzeData.error);
+    }
   }
 
   return (
     <main style={{ padding: '2rem', fontFamily: 'sans-serif' }}>
       <h1>Hello, 학습노트! 📚</h1>
-      <p>공부 노트 사진을 올려보세요.</p>
+      <p>공부 노트 사진을 올리면 AI가 요약해드려요.</p>
 
       <input
         type="file"
         accept="image/*"
         onChange={(e) => setFile(e.target.files[0])}
       />
-      <button onClick={handleUpload} disabled={uploading}>
-        {uploading ? '업로드 중...' : '업로드'}
+      <button onClick={handleUpload} disabled={uploading || analyzing}>
+        {uploading ? '업로드 중...' : analyzing ? 'AI 분석 중...' : '업로드'}
       </button>
 
       {message && <p>{message}</p>}
+
+      {result && (
+        <div style={{ marginTop: '1rem', padding: '1rem', border: '1px solid #ccc' }}>
+          <h3>📝 요약</h3>
+          <p>{result.summary}</p>
+          <h3>🔑 키워드</h3>
+          <p>{result.keywords.join(', ')}</p>
+        </div>
+      )}
     </main>
   );
 }
