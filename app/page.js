@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabaseClient';
 
 export default function Home() {
@@ -8,7 +8,27 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [message, setMessage] = useState('');
-  const [result, setResult] = useState(null);
+  const [notes, setNotes] = useState([]);
+  const [loadingNotes, setLoadingNotes] = useState(true);
+
+  // 화면이 열릴 때 지금까지의 기록을 불러오기
+  useEffect(() => {
+    loadNotes();
+  }, []);
+
+  async function loadNotes() {
+    setLoadingNotes(true);
+    // notes 테이블과 note_summaries 테이블을 한 번에 조회 (join)
+    const { data, error } = await supabase
+      .from('notes')
+      .select('*, note_summaries(summary, keywords)')
+      .order('created_at', { ascending: false });
+
+    if (!error) {
+      setNotes(data);
+    }
+    setLoadingNotes(false);
+  }
 
   async function handleUpload() {
     if (!file) {
@@ -17,7 +37,6 @@ export default function Home() {
     }
 
     setUploading(true);
-    setResult(null);
     setMessage('업로드 중...');
 
     const fileExt = file.name.split('.').pop();
@@ -51,6 +70,7 @@ export default function Home() {
 
     setMessage('업로드 성공! 이제 AI가 분석하도록 요청할게요...');
     setUploading(false);
+    loadNotes(); // 목록에 방금 올린 것을 pending 상태로 바로 반영
 
     setAnalyzing(true);
     const analyzeResponse = await fetch('/api/analyze', {
@@ -64,36 +84,69 @@ export default function Home() {
 
     if (analyzeData.success) {
       setMessage('분석 완료! ✅');
-      setResult(analyzeData);
     } else {
       setMessage('분석 실패: ' + analyzeData.error);
     }
+
+    setFile(null);
+    loadNotes(); // 분석 결과까지 반영해서 목록 새로고침
   }
 
   return (
-    <main style={{ padding: '2rem', fontFamily: 'sans-serif' }}>
+    <main style={{ maxWidth: '600px', margin: '0 auto', padding: '2rem', fontFamily: 'sans-serif' }}>
       <h1>Hello, 학습노트! 📚</h1>
       <p>공부 노트 사진을 올리면 AI가 요약해드려요.</p>
 
-      <input
-        type="file"
-        accept="image/*"
-        onChange={(e) => setFile(e.target.files[0])}
-      />
-      <button onClick={handleUpload} disabled={uploading || analyzing}>
-        {uploading ? '업로드 중...' : analyzing ? 'AI 분석 중...' : '업로드'}
-      </button>
+      <div style={{ margin: '1.5rem 0', padding: '1rem', background: '#f5f5f5', borderRadius: '8px' }}>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(e) => setFile(e.target.files[0])}
+        />
+        <button
+          onClick={handleUpload}
+          disabled={uploading || analyzing}
+          style={{ marginLeft: '0.5rem' }}
+        >
+          {uploading ? '업로드 중...' : analyzing ? 'AI 분석 중...' : '업로드'}
+        </button>
+        {message && <p style={{ marginTop: '0.5rem', fontSize: '0.9rem' }}>{message}</p>}
+      </div>
 
-      {message && <p>{message}</p>}
+      <h2>📋 지금까지의 학습 기록</h2>
 
-      {result && (
-        <div style={{ marginTop: '1rem', padding: '1rem', border: '1px solid #ccc' }}>
-          <h3>📝 요약</h3>
-          <p>{result.summary}</p>
-          <h3>🔑 키워드</h3>
-          <p>{result.keywords.join(', ')}</p>
+      {loadingNotes && <p>불러오는 중...</p>}
+      {!loadingNotes && notes.length === 0 && <p>아직 기록이 없어요. 첫 사진을 올려보세요!</p>}
+
+      {notes.map((note) => (
+        <div
+          key={note.id}
+          style={{
+            border: '1px solid #ddd',
+            borderRadius: '8px',
+            padding: '1rem',
+            marginBottom: '1rem',
+          }}
+        >
+          <img
+            src={note.image_url}
+            alt="학습 노트"
+            style={{ maxWidth: '150px', display: 'block', marginBottom: '0.5rem' }}
+          />
+          <p style={{ fontSize: '0.8rem', color: '#888' }}>
+            {new Date(note.created_at).toLocaleString('ko-KR')}
+          </p>
+
+          {note.status === 'pending' && <p>⏳ 분석 대기중...</p>}
+
+          {note.status === 'done' && note.note_summaries?.[0] && (
+            <>
+              <p><strong>📝 요약</strong>: {note.note_summaries[0].summary}</p>
+              <p><strong>🔑 키워드</strong>: {note.note_summaries[0].keywords?.join(', ')}</p>
+            </>
+          )}
         </div>
-      )}
+      ))}
     </main>
   );
 }
