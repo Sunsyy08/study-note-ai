@@ -20,10 +20,14 @@ export default function Home() {
 
   // 필터 상태
   const [subjectFilter, setSubjectFilter] = useState('전체');
-  const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const [listFilter, setListFilter] = useState('all'); // 'all' | 'favorite' | 'wrong'
 
   // 퀴즈 상태: { [노트id]: { loading, error, questions, picked } }
   const [quizzes, setQuizzes] = useState({});
+
+  // 펼침 상태
+  const [openWrong, setOpenWrong] = useState({}); // 오답노트 펼침
+  const [openScore, setOpenScore] = useState({}); // 필기 점수 상세 펼침
 
   useEffect(() => {
     loadNotes();
@@ -31,9 +35,12 @@ export default function Home() {
 
   async function loadNotes() {
     setLoadingNotes(true);
+    // notes + note_summaries(점수 포함) + wrong_answers(오답) 를 한 번에 가져옵니다
     const { data, error } = await supabase
       .from('notes')
-      .select('*, note_summaries(summary, keywords)')
+      .select(
+        '*, note_summaries(summary, keywords, score, organization_score, key_content_score, readability_score, review_score, feedback), wrong_answers(id, question, options, user_answer, correct_answer, explanation, created_at)'
+      )
       .order('created_at', { ascending: false });
 
     if (!error) {
@@ -73,8 +80,8 @@ export default function Home() {
       .insert({
         image_url: urlData.publicUrl,
         status: 'pending',
-        subject: subject,        // ← 과목 같이 저장
-        is_favorite: false,      // ← 처음엔 즐겨찾기 해제 상태
+        subject: subject,
+        is_favorite: false,
       })
       .select()
       .single();
@@ -113,7 +120,6 @@ export default function Home() {
   async function toggleFavorite(note) {
     const next = !note.is_favorite;
 
-    // 화면을 먼저 바꿔서 빠르게 반응하도록
     setNotes((prev) =>
       prev.map((n) => (n.id === note.id ? { ...n, is_favorite: next } : n))
     );
@@ -123,7 +129,6 @@ export default function Home() {
       .update({ is_favorite: next })
       .eq('id', note.id);
 
-    // 저장 실패하면 원래대로 되돌리기
     if (error) {
       setNotes((prev) =>
         prev.map((n) => (n.id === note.id ? { ...n, is_favorite: !next } : n))
@@ -180,22 +185,54 @@ export default function Home() {
     }
   }
 
-  // 퀴즈 보기 선택
-  function pickAnswer(noteId, questionIndex, optionIndex) {
-    setQuizzes((prev) => {
-      const current = prev[noteId];
-      if (!current) return prev;
-      // 이미 고른 문제는 다시 못 고르게
-      if (current.picked[questionIndex] !== undefined) return prev;
+  // 퀴즈 보기 선택 → 틀리면 오답노트에 자동 저장
+  async function pickAnswer(note, questionIndex, optionIndex) {
+    const current = quizzes[note.id];
+    if (!current || !current.questions) return;
+    // 이미 고른 문제는 다시 못 고르게
+    if (current.picked[questionIndex] !== undefined) return;
 
-      return {
-        ...prev,
-        [noteId]: {
-          ...current,
-          picked: { ...current.picked, [questionIndex]: optionIndex },
-        },
-      };
-    });
+    const q = current.questions[questionIndex];
+
+    // 1. 화면에 먼저 정답/오답 표시
+    setQuizzes((prev) => ({
+      ...prev,
+      [note.id]: {
+        ...prev[note.id],
+        picked: { ...prev[note.id].picked, [questionIndex]: optionIndex },
+      },
+    }));
+
+    // 2. 맞았으면 여기서 끝
+    if (optionIndex === q.answer) return;
+
+    // 3. 틀렸으면 오답노트에 저장
+    const { data, error } = await supabase
+      .from('wrong_answers')
+      .insert({
+        note_id: note.id,
+        question: q.question,
+        options: q.options,
+        user_answer: optionIndex,
+        correct_answer: q.answer,
+        explanation: q.explanation || null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      setMessage('오답 저장 실패: ' + error.message);
+      return;
+    }
+
+    // 4. 화면의 오답 개수를 바로 반영 (새로고침 없이)
+    setNotes((prev) =>
+      prev.map((n) =>
+        n.id === note.id
+          ? { ...n, wrong_answers: [...(n.wrong_answers || []), data] }
+          : n
+      )
+    );
   }
 
   // 퀴즈 닫기
@@ -207,12 +244,43 @@ export default function Home() {
     });
   }
 
+  // 오답 하나 지우기 (복습 완료)
+  async function deleteWrongAnswer(noteId, wrongId) {
+    const { error } = await supabase.from('wrong_answers').delete().eq('id', wrongId);
+
+    if (error) {
+      setMessage('오답 삭제 실패: ' + error.message);
+      return;
+    }
+
+    setNotes((prev) =>
+      prev.map((n) =>
+        n.id === noteId
+          ? { ...n, wrong_answers: (n.wrong_answers || []).filter((w) => w.id !== wrongId) }
+          : n
+      )
+    );
+  }
+
+  function toggleWrong(noteId) {
+    setOpenWrong((prev) => ({ ...prev, [noteId]: !prev[noteId] }));
+  }
+
+  function toggleScore(noteId) {
+    setOpenScore((prev) => ({ ...prev, [noteId]: !prev[noteId] }));
+  }
+
   // 필터 적용된 목록
   const visibleNotes = notes.filter((note) => {
-    if (favoriteOnly && !note.is_favorite) return false;
+    const wrongCount = note.wrong_answers?.length || 0;
+    if (listFilter === 'favorite' && !note.is_favorite) return false;
+    if (listFilter === 'wrong' && wrongCount === 0) return false;
     if (subjectFilter !== '전체' && (note.subject || '기타') !== subjectFilter) return false;
     return true;
   });
+
+  // 전체 오답 개수 (필터 버튼에 표시)
+  const totalWrong = notes.reduce((sum, n) => sum + (n.wrong_answers?.length || 0), 0);
 
   // 필터 버튼 스타일
   function filterBtnStyle(active) {
@@ -227,6 +295,29 @@ export default function Home() {
       cursor: 'pointer',
       fontSize: '0.85rem',
     };
+  }
+
+  // 점수 막대 한 줄
+  function ScoreBar({ label, value }) {
+    if (value == null) return null;
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
+        <span style={{ fontSize: '0.8rem', width: '110px', flexShrink: 0 }}>{label}</span>
+        <div style={{ flex: 1, height: '6px', background: '#e8e8e8', borderRadius: '999px' }}>
+          <div
+            style={{
+              width: `${value}%`,
+              height: '100%',
+              background: '#5b8def',
+              borderRadius: '999px',
+            }}
+          />
+        </div>
+        <span style={{ fontSize: '0.8rem', width: '38px', textAlign: 'right', color: '#555' }}>
+          {value}점
+        </span>
+      </div>
+    );
   }
 
   return (
@@ -281,11 +372,14 @@ export default function Home() {
           ))}
         </div>
         <div style={{ marginTop: '0.3rem' }}>
-          <button style={filterBtnStyle(!favoriteOnly)} onClick={() => setFavoriteOnly(false)}>
+          <button style={filterBtnStyle(listFilter === 'all')} onClick={() => setListFilter('all')}>
             전체 노트
           </button>
-          <button style={filterBtnStyle(favoriteOnly)} onClick={() => setFavoriteOnly(true)}>
+          <button style={filterBtnStyle(listFilter === 'favorite')} onClick={() => setListFilter('favorite')}>
             ⭐ 중요 노트만
+          </button>
+          <button style={filterBtnStyle(listFilter === 'wrong')} onClick={() => setListFilter('wrong')}>
+            ❌ 오답노트{totalWrong > 0 ? ` (${totalWrong})` : ''}
           </button>
         </div>
       </div>
@@ -293,11 +387,19 @@ export default function Home() {
       {loadingNotes && <p>불러오는 중...</p>}
       {!loadingNotes && notes.length === 0 && <p>아직 기록이 없어요. 첫 사진을 올려보세요!</p>}
       {!loadingNotes && notes.length > 0 && visibleNotes.length === 0 && (
-        <p style={{ color: '#888' }}>조건에 맞는 노트가 없어요.</p>
+        <p style={{ color: '#888' }}>
+          {listFilter === 'wrong' ? '아직 틀린 문제가 없어요. 퀴즈를 풀어보세요!' : '조건에 맞는 노트가 없어요.'}
+        </p>
       )}
 
       {visibleNotes.map((note) => {
         const quiz = quizzes[note.id];
+        const summaryRow = note.note_summaries?.[0];
+        // 최근에 틀린 것부터 보여주기
+        const wrongList = [...(note.wrong_answers || [])].sort(
+          (a, b) => new Date(b.created_at) - new Date(a.created_at)
+        );
+        const wrongCount = wrongList.length;
 
         return (
           <div
@@ -348,17 +450,151 @@ export default function Home() {
 
             {note.status === 'pending' && <p>⏳ 분석 대기중...</p>}
 
-            {note.status === 'done' && note.note_summaries?.[0] && (
+            {note.status === 'done' && summaryRow && (
               <>
-                <p><strong>📝 요약</strong>: {note.note_summaries[0].summary}</p>
-                <p><strong>🔑 키워드</strong>: {note.note_summaries[0].keywords?.join(', ')}</p>
+                <p><strong>📝 요약</strong>: {summaryRow.summary}</p>
+                <p><strong>🔑 키워드</strong>: {summaryRow.keywords?.join(', ')}</p>
 
-                {/* 🧠 퀴즈 버튼 */}
+                {/* ===== ✨ AI 필기 점수 ===== */}
+                {summaryRow.score != null && (
+                  <div style={{ marginTop: '0.6rem' }}>
+                    <button
+                      onClick={() => toggleScore(note.id)}
+                      style={{
+                        width: '100%',
+                        textAlign: 'left',
+                        padding: '0.5rem 0.7rem',
+                        borderRadius: '6px',
+                        border: '1px solid #dde3ef',
+                        background: '#f4f7fd',
+                        cursor: 'pointer',
+                        fontSize: '0.9rem',
+                      }}
+                    >
+                      ✨ AI 필기 점수{' '}
+                      <strong style={{ color: '#3b6fd4' }}>{summaryRow.score}점</strong>
+                      <span style={{ float: 'right', color: '#888', fontSize: '0.8rem' }}>
+                        {openScore[note.id] ? '닫기 ▲' : '자세히 ▼'}
+                      </span>
+                    </button>
+
+                    {openScore[note.id] && (
+                      <div
+                        style={{
+                          marginTop: '0.5rem',
+                          padding: '0.8rem',
+                          background: '#fafbfe',
+                          borderRadius: '6px',
+                        }}
+                      >
+                        <ScoreBar label="📚 내용 정리" value={summaryRow.organization_score} />
+                        <ScoreBar label="🧠 핵심 내용" value={summaryRow.key_content_score} />
+                        <ScoreBar label="👀 가독성" value={summaryRow.readability_score} />
+                        <ScoreBar label="🔄 복습하기 좋음" value={summaryRow.review_score} />
+
+                        {summaryRow.feedback && (
+                          <p style={{ fontSize: '0.85rem', marginTop: '0.7rem', lineHeight: 1.6 }}>
+                            <strong>💬 AI 한마디</strong>
+                            <br />
+                            {summaryRow.feedback}
+                          </p>
+                        )}
+
+                        <p style={{ fontSize: '0.72rem', color: '#aaa', marginTop: '0.5rem' }}>
+                          AI가 사진만 보고 매긴 참고용 점수예요.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ===== ❌ 오답노트 ===== */}
+                <div style={{ marginTop: '0.6rem' }}>
+                  {wrongCount > 0 ? (
+                    <button
+                      onClick={() => toggleWrong(note.id)}
+                      style={{
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '6px',
+                        border: '1px solid #f0c6c6',
+                        background: '#fdf3f3',
+                        color: '#b23b3b',
+                        cursor: 'pointer',
+                        fontSize: '0.85rem',
+                      }}
+                    >
+                      ❌ 오답 {wrongCount}개 {openWrong[note.id] ? '▲' : '▼'}
+                    </button>
+                  ) : (
+                    <span style={{ fontSize: '0.82rem', color: '#bbb' }}>❌ 오답 없음</span>
+                  )}
+
+                  {openWrong[note.id] && wrongCount > 0 && (
+                    <div
+                      style={{
+                        marginTop: '0.6rem',
+                        padding: '0.8rem',
+                        background: '#fdf8f8',
+                        borderRadius: '6px',
+                      }}
+                    >
+                      {wrongList.map((w, wi) => (
+                        <div
+                          key={w.id}
+                          style={{
+                            paddingBottom: '0.8rem',
+                            marginBottom: '0.8rem',
+                            borderBottom: wi === wrongList.length - 1 ? 'none' : '1px solid #eee',
+                          }}
+                        >
+                          <p style={{ fontWeight: 'bold', marginBottom: '0.4rem', fontSize: '0.9rem' }}>
+                            Q. {w.question}
+                          </p>
+
+                          <p style={{ fontSize: '0.85rem', margin: '0.2rem 0', color: '#c62828' }}>
+                            내가 선택한 답: {CIRCLE[w.user_answer]}{' '}
+                            {Array.isArray(w.options) ? w.options[w.user_answer] : ''}
+                          </p>
+                          <p style={{ fontSize: '0.85rem', margin: '0.2rem 0', color: '#2e7d32' }}>
+                            정답: {CIRCLE[w.correct_answer]}{' '}
+                            {Array.isArray(w.options) ? w.options[w.correct_answer] : ''}
+                          </p>
+
+                          {w.explanation && (
+                            <p style={{ fontSize: '0.85rem', margin: '0.4rem 0', color: '#555', lineHeight: 1.6 }}>
+                              💡 {w.explanation}
+                            </p>
+                          )}
+
+                          <p style={{ fontSize: '0.75rem', color: '#aaa', margin: '0.3rem 0' }}>
+                            {new Date(w.created_at).toLocaleString('ko-KR')}에 틀림
+                          </p>
+
+                          <button
+                            onClick={() => deleteWrongAnswer(note.id, w.id)}
+                            style={{
+                              border: 'none',
+                              background: 'none',
+                              color: '#888',
+                              cursor: 'pointer',
+                              fontSize: '0.8rem',
+                              padding: 0,
+                            }}
+                          >
+                            ✓ 복습 완료 (목록에서 지우기)
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* ===== 🧠 퀴즈 버튼 ===== */}
                 <button
                   onClick={() => makeQuiz(note)}
                   disabled={quiz?.loading}
                   style={{
-                    marginTop: '0.5rem',
+                    marginTop: '0.6rem',
                     padding: '0.4rem 0.8rem',
                     borderRadius: '6px',
                     border: '1px solid #ccc',
@@ -400,7 +636,7 @@ export default function Home() {
                           {q.options.map((opt, oi) => (
                             <button
                               key={oi}
-                              onClick={() => pickAnswer(note.id, qi, oi)}
+                              onClick={() => pickAnswer(note, qi, oi)}
                               disabled={answered}
                               style={{
                                 display: 'block',
@@ -433,7 +669,7 @@ export default function Home() {
                             <p style={{ fontSize: '0.85rem', marginTop: '0.3rem' }}>
                               {correct
                                 ? '✅ 정답입니다!'
-                                : `❌ 틀렸습니다. 정답은 ${CIRCLE[q.answer]}입니다.`}
+                                : `❌ 틀렸습니다. 정답은 ${CIRCLE[q.answer]}입니다. (오답노트에 저장됐어요)`}
                               {q.explanation && (
                                 <span style={{ color: '#666' }}> — {q.explanation}</span>
                               )}
